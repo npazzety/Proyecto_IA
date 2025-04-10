@@ -1,74 +1,89 @@
 import torch
 import torch.optim as optim
 import torch.nn as nn
-import pandas as pd
+from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, TensorDataset
 from modelo import CNN
-import torchvision.transforms as transforms
+import pandas as pd
 
 def cargar_datos(csv_file):
-    data = pd.read_csv(csv_file, header=None).values #Carga el archivo CSV
-    X = data[:, :-1].astype('float32').reshape(-1, 1, 28, 28) #Toma las caracteristicas de las imagenes (valores de los pixeles) y los convierte a valores de punto flotante. Representa cada imagen en escala de grises con valores normalizados (entre 0 y 1)
-    y = data[:, -1].astype('int64') #Contiene la columna de las etiquetas (las que dicen que tipo de figura son) y las transforma a enteros
-
-    transform = transforms.Compose([
-        transforms.RandomRotation(10),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5], std=[0.5])
-    ])
+    data = pd.read_csv(csv_file, header=None).values
+    X = data[:, :-1].astype('float32').reshape(-1, 1, 28, 28)
+    y = data[:, -1].astype('int64')
 
     X = torch.tensor(X)
-    y = torch.tensor(y) #Convierte las caracteristicas y las etiquetas en tensores de PyTorch
-    dataset = TensorDataset(X, y)
+    y = torch.tensor(y)
+    return train_test_split(X, y, test_size=0.2, random_state=42)
 
-    return dataset
+def entrenar_rna(model, train_loader, val_loader, epochs, lr, device):
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+    best_loss = float('inf')
+    patience = 5
+    trigger_times = 0
 
-def guardar_pesos_txt(model, epoch):
-    with open("pesos_por_epoca.txt", "a") as file:
-        file.write(f"Pesos de la epoca: {epoch+1}:\n")
-        for name, param in model.state_dict().items():
-            file.write(f"{name}: \n{param.numpy()}\n")
-        file.write("\n")
-
-def entrenar_rna(model, train_loader, epochs, lr):
-    optimizer = optim.Adam(model.parameters(), lr=lr) #Inicializa el optimizador Adam con los parametros del modelo. Ajusta los pesos del modelo para reducir la funcion de perdida
-    criterion = nn.CrossEntropyLoss() #Funcion de perdida para clasificacion multiclase. Calcula la diferencia entre las predicciones y las etiquedas reales, o sea, la perdida.
-    model.train() #Pone al modelo en modo de entrenamiento. Metodo heredado
-
-    open("pesos_por_epoca.txt", "w").close()
-
-    for epoch in range(epochs): #Itera por el numero de epocas
+    for epoch in range(epochs):
         epoch_loss = 0
         correct_predictions = 0
         total_predictions = 0
 
-        for X_batch, y_batch in train_loader: #Recorre los lotes del DataLoader
-            optimizer.zero_grad() #Limpia los gradientes acumulados
-            outputs = model(X_batch) #Pasa el lote por la red para obtener predicciones
-            loss = criterion(outputs, y_batch) #Calcula la perdida entre las predicciones y las etiquetas reales
-            loss.backward() #Calcula los gradientes mediante backpropagation
-            optimizer.step() #Actualiza los pesos del modelo
-            
-            epoch_loss += loss.item() #Acumula la perdida del lote
+        # Entrenamiento
+        model.train()
+        for X_batch, y_batch in train_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            optimizer.zero_grad()
+            outputs = model(X_batch)
+            loss = criterion(outputs, y_batch)
+            loss.backward()
+            optimizer.step()
 
-            #Calculo de precision
+            epoch_loss += loss.item()
             _, predicted = torch.max(outputs, 1)
             correct_predictions += (predicted == y_batch).sum().item()
             total_predictions += y_batch.size(0)
 
         accuracy = 100 * correct_predictions / total_predictions
-        print(f"Epoca {epoch+1}  Perdida: {epoch_loss:.4f}, Precision: {accuracy:.2f}%") #Imprime la perdida total de la epoca
+        print(f"Época {epoch+1}  Pérdida: {epoch_loss:.4f}, Precisión: {accuracy:.2f}%")
 
-        guardar_pesos_txt(model, epoch)
+        # Validación
+        val_loss = 0
+        correct = 0
+        total = 0
+        model.eval()
+        with torch.no_grad():
+            for X_val, y_val in val_loader:
+                X_val, y_val = X_val.to(device), y_val.to(device)
+                outputs = model(X_val)
+                loss = criterion(outputs, y_val)
+                val_loss += loss.item()
 
-    torch.save(model.state_dict(), "modelo_entrenado_final.pth") #Guarda los pesos del modelo entrenado en un archivo
-    print("Modelo guardado en modelo_entrenado_final.pth")
+                _, predicted = torch.max(outputs, 1)
+                correct += (predicted == y_val).sum().item()
+                total += y_val.size(0)
+
+        val_loss /= len(val_loader)
+        val_accuracy = 100 * correct / total
+        print(f"Validación - Pérdida: {val_loss:.4f}, Precisión: {val_accuracy:.2f}%")
+
+        # Early Stopping
+        if val_loss < best_loss:
+            best_loss = val_loss
+            trigger_times = 0
+            torch.save(model.state_dict(), "modelo_mejorado.pth")
+            print("Modelo mejorado guardado.")
+        else:
+            trigger_times += 1
+            if trigger_times >= patience:
+                print("Early stopping activado.")
+                break
 
 if __name__ == "__main__":
-    dataset = cargar_datos("figuras.csv")
-    train_loader = DataLoader(dataset, batch_size=32, shuffle=True)
+    X_train, X_val, y_train, y_val = cargar_datos("figuras.csv")
+    train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=32, shuffle=True)
+    val_loader = DataLoader(TensorDataset(X_val, y_val), batch_size=32, shuffle=False)
 
-    model = CNN()
-    entrenar_rna(model, train_loader, epochs=50, lr=0.001)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Entrenando en: {device}")
+
+    model = CNN().to(device)
+    entrenar_rna(model, train_loader, val_loader, epochs=50, lr=0.001, device=device)
